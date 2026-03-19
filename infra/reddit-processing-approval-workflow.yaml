@@ -1,0 +1,1101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  S3-triggered Step Functions workflow for Reddit processing, human approval,
+  and post-approval fanout to processing and prediction lambdas.
+
+Parameters:
+  RawBucketName:
+    Type: String
+    Default: raw-data-0938475
+  ProcessedDataBucket:
+    Type: String
+    Default: processed-data-0985432
+  ProcessedDataPrefix:
+    Type: String
+    Default: observations/
+  ProcessedArchiveBucket:
+    Type: String
+    Default: archived-data-0293483
+  ProcessedArchivePrefix:
+    Type: String
+    Default: approved/
+  ProcessorLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-west-1:647371008162:function:reddit-processor-container-lambda
+  PredictLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-west-1:647371008162:function:reddit-predict-model-container-lambda
+  TrainLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-west-1:647371008162:function:reddit-model-container-lambda
+  ProcessingLambdaRoleName:
+    Type: String
+    Default: LambdaProcessingRole
+  ApprovalNotificationTopicArn:
+    Type: String
+    Default: arn:aws:sns:us-west-1:647371008162:LambdaProcessFailure
+  ModelResultsTopicArn:
+    Type: String
+    Default: arn:aws:sns:us-west-1:647371008162:LambdaProcessFailure
+  ModelBucketName:
+    Type: String
+    Default: model-output-9087345
+  LatestModelKey:
+    Type: String
+    Default: models/reddit-risk-premium/model_latest.pt
+  TrainArchiveBucket:
+    Type: String
+    Default: processed-data-0985432
+  TrainArchivePrefix:
+    Type: String
+    Default: trained/
+  ModelTrainingQueueName:
+    Type: String
+    Default: reddit-model-training.fifo
+  ModelTrainingDlqName:
+    Type: String
+    Default: reddit-model-training-dlq.fifo
+  ModelTrainingMaxReceiveCount:
+    Type: Number
+    Default: 3
+  ProcessingTriggerQueueName:
+    Type: String
+    Default: reddit-processing-trigger.fifo
+  ProcessingTriggerDlqName:
+    Type: String
+    Default: reddit-processing-trigger-dlq.fifo
+  ProcessingTriggerMaxReceiveCount:
+    Type: Number
+    Default: 5
+  ProcessorTaskImageUri:
+    Type: String
+    Default: 647371008162.dkr.ecr.us-west-1.amazonaws.com/data-processing-fargate-ecr:latest
+  ProcessorVpcId:
+    Type: AWS::EC2::VPC::Id
+  ProcessorSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  ProcessorSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  ProcessorLogGroupName:
+    Type: String
+    Default: /ecs/reddit-processor-fargate
+  ProcessorAssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+  ProcessorTaskCpu:
+    Type: String
+    Default: '2048'
+  ProcessorTaskMemory:
+    Type: String
+    Default: '16384'
+  MaxConcurrentProcessingRuns:
+    Type: Number
+    Default: 5
+  ProcessorBatchSizeTwitter:
+    Type: String
+    Default: '128'
+  ProcessorBatchSizeFinbert:
+    Type: String
+    Default: '64'
+  ProcessorChunkSizeItems:
+    Type: String
+    Default: '4096'
+  ModelQueueFlushThreshold:
+    Type: Number
+    Default: 50
+  ModelQueueMaxWaitSeconds:
+    Type: Number
+    Default: 1800
+  ModelQueueMaxBatchMessages:
+    Type: Number
+    Default: 50
+  ModelQueuePollScheduleExpression:
+    Type: String
+    Default: rate(1 minute)
+
+Resources:
+  ApprovalNotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishApprovalNotifications
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ApprovalNotificationTopicArn
+
+  ApprovalNotifierLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: reddit-human-approval-notifier
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt ApprovalNotifierRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, urllib.parse
+          sns = boto3.client("sns")
+          def lambda_handler(event, context):
+              token = event["taskToken"]
+              topic_arn = event["approval_topic_arn"]
+              callback = event["callback_base_url"].rstrip("/")
+              encoded = urllib.parse.quote(token, safe="")
+              approve_url = f"{callback}?decision=approve&token={encoded}"
+              deny_url = f"{callback}?decision=deny&token={encoded}"
+              processed = event.get("processed_output", {})
+              message = (
+                  f"Execution: {event.get('state_machine_name')}/{event.get('execution_name')}\n"
+                  f"Processed bucket: {processed.get('bucket')}\n"
+                  f"Processed prefix: {processed.get('prefix')}\n"
+                  f"Processed keys: {processed.get('keys', [])}\n\n"
+                  f"Approve: {approve_url}\n"
+                  f"Deny: {deny_url}\n"
+              )
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject="Reddit workflow approval required",
+                  Message=message,
+              )
+              return {"status": "notification_sent", "topic_arn": topic_arn}
+
+  ApprovalCallbackRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SendTaskCallbacks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: '*'
+
+  ApprovalCallbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: reddit-human-approval-callback
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt ApprovalCallbackRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json
+          sfn = boto3.client("stepfunctions")
+          def response(code, body):
+              return {
+                  "statusCode": code,
+                  "headers": {"Content-Type": "text/html; charset=utf-8"},
+                  "body": body,
+              }
+          def lambda_handler(event, context):
+              query = event.get("queryStringParameters") or {}
+              token = query.get("token")
+              decision = (query.get("decision") or "").strip().lower()
+              if not token or decision not in ("approve", "deny"):
+                  return response(400, "<h1>Invalid approval request</h1>")
+              if decision == "approve":
+                  sfn.send_task_success(
+                      taskToken=token,
+                      output=json.dumps({"approved": True, "approved_by": "function-url"}),
+                  )
+                  return response(200, "<h1>Approval recorded</h1>")
+              sfn.send_task_failure(
+                  taskToken=token,
+                  error="HumanApprovalDenied",
+                  cause="Rejected from approval URL",
+              )
+              return response(200, "<h1>Denial recorded</h1>")
+
+  ApprovalCallbackFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt ApprovalCallbackLambda.Arn
+
+  ApprovalCallbackUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref ApprovalCallbackLambda
+      FunctionUrlAuthType: NONE
+      Principal: '*'
+
+  ModelTrainingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref ModelTrainingDlqName
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      MessageRetentionPeriod: 1209600
+
+  ModelTrainingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref ModelTrainingQueueName
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ModelTrainingDeadLetterQueue.Arn
+        maxReceiveCount: !Ref ModelTrainingMaxReceiveCount
+
+  ProcessingTriggerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref ProcessingTriggerDlqName
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600
+
+  ProcessingTriggerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref ProcessingTriggerQueueName
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingTriggerDeadLetterQueue.Arn
+        maxReceiveCount: !Ref ProcessingTriggerMaxReceiveCount
+
+  ProcessingTriggerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ProcessingTriggerQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ProcessingTriggerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt RawBucketObjectCreatedRule.Arn
+
+  ProcessingQueueWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartProcessingWorkflowSequentially
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:ListExecutions
+                Resource: !Ref RedditProcessingStateMachine
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource:
+                  - !GetAtt ProcessingTriggerQueue.Arn
+
+  ProcessingQueueWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: reddit-processing-queue-worker
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt ProcessingQueueWorkerRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref RedditProcessingStateMachine
+          MAX_RUNNING_EXECUTIONS: !Ref MaxConcurrentProcessingRuns
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import hashlib
+            import json
+            import os
+            import re
+
+            import boto3
+            from botocore.exceptions import ClientError
+
+            sfn = boto3.client("stepfunctions")
+
+            STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
+            MAX_RUNNING_EXECUTIONS = max(1, int(os.environ.get("MAX_RUNNING_EXECUTIONS", "5")))
+
+            def _running_execution_count():
+                resp = sfn.list_executions(
+                    stateMachineArn=STATE_MACHINE_ARN,
+                    statusFilter="RUNNING",
+                    maxResults=MAX_RUNNING_EXECUTIONS,
+                )
+                return len(resp.get("executions") or [])
+
+            def _execution_name(payload):
+                record = ((payload.get("Records") or [{}])[0].get("s3") or {})
+                bucket = ((record.get("bucket") or {}).get("name")) or "bucket"
+                key = (((record.get("object") or {}).get("key")) or "monthly-ready")
+                digest = hashlib.md5(f"{bucket}:{key}".encode("utf-8")).hexdigest()[:16]
+                safe_key = re.sub(r"[^A-Za-z0-9_-]+", "-", key).strip("-") or "monthly-ready"
+                safe_key = safe_key[-63:]
+                return f"{safe_key}_{digest}"[-80:]
+
+            def lambda_handler(event, context):
+                results = []
+                batch_item_failures = []
+                for record in event.get("Records") or []:
+                    message_id = record.get("messageId")
+                    if _running_execution_count() >= MAX_RUNNING_EXECUTIONS:
+                        batch_item_failures.append({"itemIdentifier": message_id})
+                        results.append(
+                            {
+                                "message_id": message_id,
+                                "status": "deferred",
+                                "reason": "max_concurrency",
+                            }
+                        )
+                        continue
+                    payload = json.loads(record["body"])
+                    execution_name = _execution_name(payload)
+
+                    try:
+                        started = sfn.start_execution(
+                            stateMachineArn=STATE_MACHINE_ARN,
+                            name=execution_name,
+                            input=json.dumps(payload),
+                        )
+                        results.append(
+                            {
+                                "message_id": message_id,
+                                "status": "started",
+                                "execution_arn": started["executionArn"],
+                            }
+                        )
+                    except ClientError as exc:
+                        if exc.response.get("Error", {}).get("Code") != "ExecutionAlreadyExists":
+                            raise
+                        results.append(
+                            {
+                                "message_id": message_id,
+                                "status": "already_started",
+                                "execution_name": execution_name,
+                            }
+                        )
+                return {"results": results, "batchItemFailures": batch_item_failures}
+
+  ProcessingQueueWorkerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ProcessingTriggerQueue.Arn
+      FunctionName: !Ref ProcessingQueueWorkerLambda
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ModelQueueWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeModelLambdasAndReadQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Ref TrainLambdaArn
+                  - !Ref PredictLambdaArn
+              - Effect: Allow
+                Action:
+                  - states:ListExecutions
+                Resource: !Ref RedditProcessingStateMachine
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                  - sqs:SendMessage
+                Resource: !GetAtt ModelTrainingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+
+  ModelQueueWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: reddit-model-queue-worker
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt ModelQueueWorkerRole.Arn
+      Environment:
+        Variables:
+          MODEL_TRAINING_QUEUE_URL: !Ref ModelTrainingQueue
+          MODEL_TRAINING_QUEUE_NAME: !Ref ModelTrainingQueueName
+          PROCESSING_STATE_MACHINE_ARN: !Ref RedditProcessingStateMachine
+          MODEL_QUEUE_FLUSH_THRESHOLD: !Ref ModelQueueFlushThreshold
+          MODEL_QUEUE_MAX_WAIT_SECONDS: !Ref ModelQueueMaxWaitSeconds
+          MODEL_QUEUE_MAX_BATCH_MESSAGES: !Ref ModelQueueMaxBatchMessages
+          MODEL_QUEUE_GROUP_ID: reddit-model-training
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import json
+            import hashlib
+            import os
+            import time
+            from datetime import datetime, timedelta, timezone
+
+            import boto3
+
+            lam = boto3.client("lambda")
+            sqs = boto3.client("sqs")
+            sfn = boto3.client("stepfunctions")
+            cloudwatch = boto3.client("cloudwatch")
+
+            MODEL_TRAINING_QUEUE_URL = os.environ["MODEL_TRAINING_QUEUE_URL"]
+            MODEL_TRAINING_QUEUE_NAME = os.environ["MODEL_TRAINING_QUEUE_NAME"]
+            PROCESSING_STATE_MACHINE_ARN = os.environ["PROCESSING_STATE_MACHINE_ARN"]
+            MODEL_QUEUE_FLUSH_THRESHOLD = max(1, int(os.environ.get("MODEL_QUEUE_FLUSH_THRESHOLD", "50")))
+            MODEL_QUEUE_MAX_WAIT_SECONDS = max(60, int(os.environ.get("MODEL_QUEUE_MAX_WAIT_SECONDS", "1800")))
+            MODEL_QUEUE_MAX_BATCH_MESSAGES = max(1, int(os.environ.get("MODEL_QUEUE_MAX_BATCH_MESSAGES", "50")))
+            MODEL_QUEUE_GROUP_ID = os.environ.get("MODEL_QUEUE_GROUP_ID", "reddit-model-training")
+
+            def _invoke(function_name, payload):
+                resp = lam.invoke(
+                    FunctionName=function_name,
+                    InvocationType="RequestResponse",
+                    Payload=json.dumps(payload).encode("utf-8"),
+                )
+                raw = resp["Payload"].read()
+                body = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+                if resp.get("FunctionError"):
+                    raise RuntimeError(f"{function_name} failed: {body}")
+                return body
+
+            def _queue_attributes():
+                resp = sqs.get_queue_attributes(
+                    QueueUrl=MODEL_TRAINING_QUEUE_URL,
+                    AttributeNames=[
+                        "ApproximateNumberOfMessages",
+                    ],
+                )
+                attrs = resp.get("Attributes") or {}
+                visible = int(attrs.get("ApproximateNumberOfMessages", "0"))
+                oldest_age = 0
+                if visible > 0:
+                    end_time = datetime.now(timezone.utc)
+                    start_time = end_time - timedelta(minutes=10)
+                    metric = cloudwatch.get_metric_statistics(
+                        Namespace="AWS/SQS",
+                        MetricName="ApproximateAgeOfOldestMessage",
+                        Dimensions=[
+                            {"Name": "QueueName", "Value": MODEL_TRAINING_QUEUE_NAME}
+                        ],
+                        StartTime=start_time,
+                        EndTime=end_time,
+                        Period=60,
+                        Statistics=["Maximum"],
+                    )
+                    datapoints = metric.get("Datapoints") or []
+                    if datapoints:
+                        oldest_age = int(max(point.get("Maximum", 0) for point in datapoints))
+                return visible, oldest_age
+
+            def _running_processing_count():
+                resp = sfn.list_executions(
+                    stateMachineArn=PROCESSING_STATE_MACHINE_ARN,
+                    statusFilter="RUNNING",
+                    maxResults=1,
+                )
+                return len(resp.get("executions") or [])
+
+            def _receive_messages(limit):
+                messages = []
+                while len(messages) < limit:
+                    remaining = min(10, limit - len(messages))
+                    resp = sqs.receive_message(
+                        QueueUrl=MODEL_TRAINING_QUEUE_URL,
+                        MaxNumberOfMessages=remaining,
+                        AttributeNames=["All"],
+                        MessageAttributeNames=["All"],
+                        VisibilityTimeout=900,
+                        WaitTimeSeconds=0,
+                    )
+                    batch = resp.get("Messages") or []
+                    if not batch:
+                        break
+                    messages.extend(batch)
+
+                    delete_entries = [
+                        {"Id": str(idx), "ReceiptHandle": message["ReceiptHandle"]}
+                        for idx, message in enumerate(batch)
+                    ]
+                    delete_resp = sqs.delete_message_batch(
+                        QueueUrl=MODEL_TRAINING_QUEUE_URL,
+                        Entries=delete_entries,
+                    )
+                    failed = delete_resp.get("Failed") or []
+                    if failed:
+                        raise RuntimeError(f"Failed deleting drained queue messages: {failed}")
+                return messages
+
+            def _group_messages(messages):
+                grouped = {}
+                for message in messages:
+                    body = json.loads(message["Body"])
+                    group_key = (
+                        body["source_bucket"],
+                        body["model_bucket"],
+                        body["model_key"],
+                        body["predict_output_bucket"],
+                        body["archive_bucket"],
+                        body["archive_prefix"],
+                        body.get("sns_topic_arn"),
+                    )
+                    grouped.setdefault(group_key, []).append(body)
+                return grouped
+
+            def _process_group(bodies):
+                first = bodies[0]
+                sources = [
+                    {"bucket": body["source_bucket"], "key": body["source_key"]}
+                    for body in bodies
+                ]
+
+                train_payload = {
+                    "sources": sources,
+                    "model_bucket": first["model_bucket"],
+                    "model_key": first["model_key"],
+                    "archive_after_train": False,
+                }
+                train_result = _invoke("${TrainLambdaArn}", train_payload)
+
+                predict_payload = {
+                    "action": "predict",
+                    "sources": sources,
+                    "output_bucket": first["predict_output_bucket"],
+                    "sns_topic_arn": first.get("sns_topic_arn"),
+                    "archive_bucket": first["archive_bucket"],
+                    "archive_prefix": first["archive_prefix"],
+                    "model_bucket": first["model_bucket"],
+                    "model_key": first["model_key"],
+                }
+                predict_result = _invoke("${PredictLambdaArn}", predict_payload)
+
+                return {
+                    "source_bucket": first["source_bucket"],
+                    "sources": [body["source_key"] for body in bodies],
+                    "train": train_result,
+                    "predict": predict_result,
+                }
+
+            def _requeue(messages):
+                if not messages:
+                    return
+                timestamp_ms = int(time.time() * 1000)
+                for batch_start in range(0, len(messages), 10):
+                    chunk = messages[batch_start:batch_start + 10]
+                    entries = []
+                    for offset, message in enumerate(chunk):
+                        body = message["Body"]
+                        body_digest = hashlib.md5(body.encode("utf-8")).hexdigest()
+                        entries.append(
+                            {
+                                "Id": str(batch_start + offset),
+                                "MessageBody": body,
+                                "MessageGroupId": MODEL_QUEUE_GROUP_ID,
+                                "MessageDeduplicationId": f"{timestamp_ms}-{batch_start + offset}-{body_digest}"[:128],
+                            }
+                        )
+                    resp = sqs.send_message_batch(
+                        QueueUrl=MODEL_TRAINING_QUEUE_URL,
+                        Entries=entries,
+                    )
+                    failed = resp.get("Failed") or []
+                    if failed:
+                        raise RuntimeError(f"Failed requeueing drained model messages: {failed}")
+
+            def lambda_handler(event, context):
+                visible_messages, oldest_age = _queue_attributes()
+                running_processing = _running_processing_count()
+                if visible_messages <= 0:
+                    return {
+                        "status": "noop",
+                        "reason": "empty_queue",
+                        "visible_messages": visible_messages,
+                        "oldest_age_seconds": oldest_age,
+                        "running_processing": running_processing,
+                    }
+
+                flush_reason = None
+                if visible_messages >= MODEL_QUEUE_FLUSH_THRESHOLD:
+                    flush_reason = "threshold"
+                elif oldest_age >= MODEL_QUEUE_MAX_WAIT_SECONDS:
+                    flush_reason = "max_wait"
+                elif running_processing == 0:
+                    flush_reason = "processing_idle"
+
+                if flush_reason is None:
+                    return {
+                        "status": "deferred",
+                        "visible_messages": visible_messages,
+                        "oldest_age_seconds": oldest_age,
+                        "running_processing": running_processing,
+                    }
+
+                drained_messages = _receive_messages(MODEL_QUEUE_MAX_BATCH_MESSAGES)
+                if not drained_messages:
+                    return {
+                        "status": "noop",
+                        "reason": "nothing_drained",
+                        "flush_reason": flush_reason,
+                        "visible_messages": visible_messages,
+                        "oldest_age_seconds": oldest_age,
+                        "running_processing": running_processing,
+                    }
+
+                grouped_messages = _group_messages(drained_messages)
+                results = []
+                try:
+                    for bodies in grouped_messages.values():
+                        results.append(_process_group(bodies))
+                except Exception:
+                    _requeue(drained_messages)
+                    raise
+
+                return {
+                    "status": "flushed",
+                    "flush_reason": flush_reason,
+                    "batch_size": len(drained_messages),
+                    "group_count": len(grouped_messages),
+                    "visible_messages": visible_messages,
+                    "oldest_age_seconds": oldest_age,
+                    "running_processing": running_processing,
+                    "results": results,
+                }
+
+  ModelQueueWorkerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Ref ModelQueuePollScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ModelQueueWorkerLambda.Arn
+          Id: model-queue-worker-schedule
+
+  ModelQueueWorkerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ModelQueueWorkerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelQueueWorkerScheduleRule.Arn
+
+  ProcessorFargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: reddit-processor-fargate
+
+  ProcessorFargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ProcessorFargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessorFargateTaskAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${RawBucketName}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${RawBucketName}
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${ProcessedDataBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ProcessedDataBucket}
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${ProcessedArchiveBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ProcessedArchiveBucket}
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: '*'
+
+  ProcessorFargateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: reddit-processor-fargate
+      Cpu: !Ref ProcessorTaskCpu
+      Memory: !Ref ProcessorTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ProcessorFargateTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProcessorFargateTaskRole.Arn
+      ContainerDefinitions:
+        - Name: processor
+          Image: !Ref ProcessorTaskImageUri
+          Essential: true
+          Environment:
+            - Name: INPUT_BUCKET
+              Value: !Ref RawBucketName
+            - Name: ARCHIVE_BUCKET
+              Value: !Ref ProcessedArchiveBucket
+            - Name: ARCHIVE_PREFIX
+              Value: !Ref ProcessedArchivePrefix
+            - Name: OBS_OUTPUT_S3_BUCKET
+              Value: !Ref ProcessedDataBucket
+            - Name: OBS_OUTPUT_S3_PREFIX
+              Value: !Ref ProcessedDataPrefix
+            - Name: MANIFEST_PREFIX
+              Value: manifest_
+            - Name: MANIFEST_SUFFIX
+              Value: .json
+            - Name: BATCH_SIZE_TWITTER
+              Value: !Ref ProcessorBatchSizeTwitter
+            - Name: BATCH_SIZE_FINBERT
+              Value: !Ref ProcessorBatchSizeFinbert
+            - Name: CHUNK_SIZE_ITEMS
+              Value: !Ref ProcessorChunkSizeItems
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProcessorLogGroupName
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: processor
+
+  ProcessorStepFunctionsCallbackPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: reddit-processor-stepfunctions-callback
+      Roles:
+        - !Ref ProcessingLambdaRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:SendTaskSuccess
+              - states:SendTaskFailure
+            Resource: '*'
+
+  WorkflowStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeWorkflowLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Ref PredictLambdaArn
+                  - !Ref TrainLambdaArn
+                  - !GetAtt ApprovalNotifierLambda.Arn
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref ProcessorFargateTaskDefinition
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt ProcessorFargateTaskExecutionRole.Arn
+                  - !GetAtt ProcessorFargateTaskRole.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ModelTrainingQueue.Arn
+
+  RedditProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: reddit-processing-human-approval
+      RoleArn: !GetAtt WorkflowStateMachineRole.Arn
+      DefinitionString:
+        Fn::Sub:
+          - |
+            {
+              "StartAt": "ProcessRawData",
+              "States": {
+                "ProcessRawData": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::ecs:runTask.waitForTaskToken",
+                  "Parameters": {
+                    "LaunchType": "FARGATE",
+                    "Cluster": "${ProcessorFargateClusterArn}",
+                    "TaskDefinition": "${ProcessorFargateTaskDefinitionArn}",
+                    "NetworkConfiguration": {
+                      "AwsvpcConfiguration": {
+                        "AssignPublicIp": "${ProcessorAssignPublicIp}",
+                        "SecurityGroups": ["${ProcessorTaskSecurityGroupId}"],
+                        "Subnets": ["${ProcessorSubnetIdsJson}"]
+                      }
+                    },
+                    "Overrides": {
+                      "ContainerOverrides": [
+                        {
+                          "Name": "processor",
+                          "Environment": [
+                            {"Name": "STEP_FUNCTION_TASK_TOKEN", "Value.$": "$$.Task.Token"},
+                            {"Name": "PROCESSOR_TRIGGER_BUCKET", "Value.$": "$.Records[0].s3.bucket.name"},
+                            {"Name": "PROCESSOR_TRIGGER_KEY", "Value.$": "$.Records[0].s3.object.key"},
+                            {"Name": "PROCESSOR_OUTPUT_BUCKET", "Value": "${ProcessedDataBucket}"},
+                            {"Name": "PROCESSOR_OUTPUT_PREFIX", "Value": "${ProcessedDataPrefix}"},
+                            {"Name": "PROCESSOR_OUTPUT_FILE_PREFIX", "Value.$": "States.Format('observations_{}', $$.Execution.Name)"}
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "ResultPath": "$.ProcessResult",
+                  "Next": "HasProcessedOutput"
+                },
+                "HasProcessedOutput": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.ProcessResult.output.bucket",
+                      "IsPresent": true,
+                      "Next": "HasProcessedFiles"
+                    }
+                  ],
+                  "Default": "NoProcessedOutput"
+                },
+                "HasProcessedFiles": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.ProcessResult.output.keys[0]",
+                      "IsPresent": true,
+                      "Next": "ApprovedFanout"
+                    }
+                  ],
+                  "Default": "NoProcessedOutput"
+                },
+                "NoProcessedOutput": {
+                  "Type": "Succeed"
+                },
+                "ApprovedFanout": {
+                  "Type": "Map",
+                  "ItemsPath": "$.ProcessResult.output.keys",
+                  "MaxConcurrency": 1,
+                  "Parameters": {
+                    "source_bucket": "${ProcessedDataBucket}",
+                    "source_key.$": "$$.Map.Item.Value",
+                    "model_bucket": "${ModelBucketName}",
+                    "model_key": "${LatestModelKey}",
+                    "predict_output_bucket": "${ModelBucketName}",
+                    "sns_topic_arn": "${ModelResultsTopicArn}",
+                    "archive_bucket": "${ProcessedArchiveBucket}",
+                    "archive_prefix": "${ProcessedArchivePrefix}",
+                    "execution_name.$": "$$.Execution.Name"
+                  },
+                  "Iterator": {
+                    "StartAt": "EnqueueModelTraining",
+                    "States": {
+                      "EnqueueModelTraining": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::sqs:sendMessage",
+                        "Parameters": {
+                          "QueueUrl": "${ModelTrainingQueueUrl}",
+                          "MessageGroupId": "reddit-model-training",
+                          "MessageDeduplicationId.$": "States.Format('{}:{}', $.execution_name, States.Hash($.source_key, 'MD5'))",
+                          "MessageBody": {
+                            "source_bucket.$": "$.source_bucket",
+                            "source_key.$": "$.source_key",
+                            "model_bucket.$": "$.model_bucket",
+                            "model_key.$": "$.model_key",
+                            "predict_output_bucket.$": "$.predict_output_bucket",
+                            "sns_topic_arn.$": "$.sns_topic_arn",
+                            "archive_bucket.$": "$.archive_bucket",
+                            "archive_prefix.$": "$.archive_prefix"
+                          }
+                        },
+                        "End": true
+                      }
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - {
+              ApprovalCallbackUrl: !GetAtt ApprovalCallbackFunctionUrl.FunctionUrl,
+              ApprovalNotifierLambdaArn: !GetAtt ApprovalNotifierLambda.Arn,
+              ModelTrainingQueueUrl: !Ref ModelTrainingQueue,
+              TrainLambdaName: !Select [6, !Split [":", !Ref TrainLambdaArn]],
+              PredictLambdaName: !Select [6, !Split [":", !Ref PredictLambdaArn]],
+              ProcessorFargateClusterArn: !GetAtt ProcessorFargateCluster.Arn,
+              ProcessorFargateTaskDefinitionArn: !Ref ProcessorFargateTaskDefinition,
+              ProcessorTaskSecurityGroupId: !Ref ProcessorSecurityGroupId,
+              ProcessorSubnetIdsJson: !Join ['","', !Ref ProcessorSubnetIds],
+              ProcessorAssignPublicIp: !Ref ProcessorAssignPublicIp
+            }
+
+  RawBucketObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: reddit-raw-data-object-created
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref RawBucketName
+          object:
+            key:
+              - suffix: monthly_ready.json
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProcessingTriggerQueue.Arn
+          Id: QueueRedditProcessingWorkflow
+          SqsParameters:
+            MessageGroupId: reddit-processing-trigger
+          InputTransformer:
+            InputPathsMap:
+              event_id: $.id
+              event_time: $.time
+              bucket: $.detail.bucket.name
+              key: $.detail.object.key
+            InputTemplate: >-
+              {"event_id":"<event_id>","event_time":"<event_time>","Records":[{"s3":{"bucket":{"name":"<bucket>"},"object":{"key":"<key>"}}}]}
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref RedditProcessingStateMachine
+  ApprovalUrl:
+    Value: !GetAtt ApprovalCallbackFunctionUrl.FunctionUrl
+  ApprovalTopicArn:
+    Value: !Ref ApprovalNotificationTopicArn
+  ModelTrainingQueueUrl:
+    Value: !Ref ModelTrainingQueue
+  ModelQueueWorkerLambdaArn:
+    Value: !GetAtt ModelQueueWorkerLambda.Arn
+  ModelTrainingDeadLetterQueueUrl:
+    Value: !Ref ModelTrainingDeadLetterQueue
+  ProcessingTriggerQueueUrl:
+    Value: !Ref ProcessingTriggerQueue
+  ProcessingQueueWorkerLambdaArn:
+    Value: !GetAtt ProcessingQueueWorkerLambda.Arn
+  ProcessingTriggerDeadLetterQueueUrl:
+    Value: !Ref ProcessingTriggerDeadLetterQueue
+  ProcessorFargateClusterArn:
+    Value: !GetAtt ProcessorFargateCluster.Arn
+  ProcessorFargateTaskDefinitionArn:
+    Value: !Ref ProcessorFargateTaskDefinition

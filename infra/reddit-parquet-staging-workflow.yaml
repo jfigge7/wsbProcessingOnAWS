@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  S3 staging bucket and Python Lambda that pairs daily comments/submissions parquet
+  uploads, copies them into the raw-data bucket, emits a manifest JSON, and removes
+  staged source files.
+
+Parameters:
+  RawBucketName:
+    Type: String
+    Default: raw-data-0938475
+  RawPrefix:
+    Type: String
+    Default: imported-parquet/
+  DeleteSourceAfterStage:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+  StagingLambdaImageUri:
+    Type: String
+    Default: 647371008162.dkr.ecr.us-west-1.amazonaws.com/reddit-parquet-staging-ecr:latest
+
+Resources:
+  StagingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: StagingBucketInvokePermission
+    Properties:
+      BucketName: !Sub reddit-parquet-staging-${AWS::AccountId}-${AWS::Region}
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt StagingLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .parquet
+
+  StagingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StagingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::reddit-parquet-staging-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:aws:s3:::reddit-parquet-staging-${AWS::AccountId}-${AWS::Region}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  StagingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: reddit-parquet-staging-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: staging-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::reddit-parquet-staging-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:aws:s3:::reddit-parquet-staging-${AWS::AccountId}-${AWS::Region}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${RawBucketName}
+                  - !Sub arn:aws:s3:::${RawBucketName}/*
+
+  StagingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: reddit-parquet-staging-lambda-v2
+      PackageType: Image
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt StagingLambdaRole.Arn
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucketName
+          RAW_PREFIX: !Ref RawPrefix
+          DELETE_SOURCE_AFTER_STAGE: !Ref DeleteSourceAfterStage
+          TARGET_COMMENTS_PER_BATCH: '50000'
+          ORPHAN_GRACE_SECONDS: '900'
+          MAX_TRADING_DAYS_PER_BATCH: '1'
+      Code:
+        ImageUri: !Ref StagingLambdaImageUri
+
+  StagingBucketInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StagingLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::reddit-parquet-staging-${AWS::AccountId}-${AWS::Region}
+
+Outputs:
+  StagingBucketName:
+    Value: !Ref StagingBucket
+  StagingLambdaArn:
+    Value: !GetAtt StagingLambda.Arn

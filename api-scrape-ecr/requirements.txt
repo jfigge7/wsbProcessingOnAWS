@@ -1,0 +1,5 @@
+asyncpraw
+asyncprawcore
+pandas
+pyarrow
+boto3

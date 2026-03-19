@@ -1,0 +1,8 @@
+boto3
+asyncpraw
+asyncprawcore
+pandas
+pyarrow
+torch
+transformers
+uvicorn

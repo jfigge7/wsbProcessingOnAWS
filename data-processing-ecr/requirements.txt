@@ -1,0 +1,7 @@
+boto3
+pandas==2.2.3
+pyarrow==17.0.0
+torch
+transformers
+pandas-market-calendars
+python-dotenv
